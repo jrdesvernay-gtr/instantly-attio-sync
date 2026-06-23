@@ -1,6 +1,6 @@
 # Instantly → Attio Sync
 
-Webhook server that syncs Instantly.ai lead events into Attio CRM (Person records + "New Lifecycle" list entries) in real time.
+Webhook server that syncs Instantly.ai lead events into Attio CRM in real time: upserts a Person record (contact + UTM_Campaign), upserts a Company record (matched by email domain), and manages that Company's entry in the "New Lifecycle" list.
 
 ## Setup
 
@@ -42,10 +42,23 @@ To receive real Instantly webhooks locally, expose your server with a tunnel (e.
 3. In Railway's project settings, add the same environment variables from `.env.example` (with real values).
 4. Once deployed, set the Railway URL + `/webhook/instantly` as the webhook endpoint in Instantly.
 
+## Instantly webhook subscription
+
+Subscribe only to the events in `EVENT_STAGE_MAP` (`instantly_attio_sync.py`), not "all events" — anything else is dropped on arrival and just wastes webhook volume:
+
+| Instantly event_type | Attio stage |
+|---|---|
+| `email_sent` | Lead Captured |
+| `reply_received` | Engaged |
+| `lead_interested` | Interested |
+| `lead_not_interested` | Churned |
+
+These event names and the `lead_email` payload field are taken from Instantly's [webhook events schema reference](https://developer.instantly.ai/guides/webhook-events.md) — verify against that doc if Instantly changes their API.
+
 ## Behavior notes
 
-- All incoming events are logged with timestamp, event type, and email.
+- All incoming events are logged with timestamp, event type, and lead email.
 - The server always returns `200` to Instantly, even on internal/Attio errors, so Instantly won't endlessly retry. Errors are logged with the full Attio response body.
-- Events without an email are logged and skipped.
-- `email_sent` → upserts the Person, creates a list entry with stage "Lead Captured" (skips silently on a 409 duplicate-entry error).
-- `email_reply` / `lead_interested` / `lead_not_interested` → looks up the existing list entry for that person and updates its stage. If no entry exists yet, one is created with the appropriate stage instead of failing.
+- Events without a `lead_email` are logged and skipped.
+- A Company is upserted per event, matched by the lead's email domain (Attio's Companies object has no usable `company_name` matching attribute, only `domains`). If `company_name` isn't present in the payload, the list entry is skipped (logged) since the list is keyed on Companies.
+- The list does not enforce one-entry-per-record, so the server always looks up an existing entry for the company first and `PATCH`es its stage; only creates a new entry if none exists yet.

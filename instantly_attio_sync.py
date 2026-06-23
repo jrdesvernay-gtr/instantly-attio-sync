@@ -39,7 +39,7 @@ app = FastAPI()
 
 EVENT_STAGE_MAP = {
     "email_sent": "Lead Captured",
-    "email_reply": "Engaged",
+    "reply_received": "Engaged",
     "lead_interested": "Interested",
     "lead_not_interested": "Churned",
 }
@@ -50,7 +50,7 @@ def normalize_campaign_name(campaign_name: str) -> str:
 
 
 async def upsert_person(client: httpx.AsyncClient, payload: dict) -> dict | None:
-    email = payload.get("email")
+    email = payload.get("lead_email")
     if not email:
         logger.warning("Skipping upsert_person: missing email in payload")
         return None
@@ -150,7 +150,7 @@ async def update_list_entry_stage(client: httpx.AsyncClient, entry_id: str, stag
 
 async def handle_event(payload: dict) -> None:
     event_type = payload.get("event_type")
-    email = payload.get("email")
+    email = payload.get("lead_email")
     logger.info("Received event=%s email=%s at %s", event_type, email, datetime.now(timezone.utc).isoformat())
 
     stage = EVENT_STAGE_MAP.get(event_type)
@@ -212,7 +212,7 @@ async def health():
 async def test():
     mock_payload = {
         "event_type": "email_sent",
-        "email": "test.lead@example.com",
+        "lead_email": "test.lead@example.com",
         "first_name": "Test",
         "last_name": "Lead",
         "company_name": "Example Co",
