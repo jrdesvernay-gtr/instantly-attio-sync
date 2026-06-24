@@ -1,6 +1,6 @@
 # Instantly → Attio Sync
 
-Webhook server that syncs Instantly.ai lead events into Attio CRM in real time: upserts a Person record (contact + UTM_Campaign), upserts a Company record (matched by email domain), and manages that Company's entry in the "New Lifecycle" list.
+Webhook server that syncs Instantly.ai lead events into Attio CRM in real time: upserts a Person record (contact + UTM_Campaign), upserts a Company record (matched by normalized website URL), and manages that Company's entry in the "New Lifecycle" list.
 
 ## Setup
 
@@ -60,5 +60,7 @@ These event names and the `lead_email` payload field are taken from Instantly's 
 - All incoming events are logged with timestamp, event type, and lead email.
 - The server always returns `200` to Instantly, even on internal/Attio errors, so Instantly won't endlessly retry. Errors are logged with the full Attio response body.
 - Events without a `lead_email` are logged and skipped.
-- A Company is upserted per event, matched by the lead's email domain (Attio's Companies object has no usable `company_name` matching attribute, only `domains`). If `company_name` isn't present in the payload, the list entry is skipped (logged) since the list is keyed on Companies.
+- A Company is upserted per event, matched on the lead's `website` field (query string stripped, path kept) via a custom `instantly_website_url` text attribute. Matching on email/registrable-domain alone would incorrectly merge unrelated SMB leads that share a third-party host (Facebook, eBay, Alibaba pages all resolve to the same root domain); each business's specific page is the actual unique identity. Attio doesn't support `is_unique` on text attributes, so the match-then-create lookup happens in application code (`find_company_by_website`), not via Attio's built-in `matching_attribute` upsert. Falls back to email-domain matching only when a payload has no `website` field.
+- `company_name` (and `first_name`/`last_name`) come from the webhook payload's camelCase fields (`companyName`/`firstName`/`lastName` — Instantly's real payload differs from their docs example). If still missing, falls back to looking the lead up via Instantly's `/leads/list` API by email. If a company name still can't be found, the list entry is skipped (logged) since the list is keyed on Companies.
 - The list does not enforce one-entry-per-record, so the server always looks up an existing entry for the company first and `PATCH`es its stage; only creates a new entry if none exists yet.
+- Switching the company-matching scheme means Company records created under the old domain-based identity won't merge with new website-based ones — expect one-time duplicates for companies already in Attio from before this change.
