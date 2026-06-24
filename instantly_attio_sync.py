@@ -157,7 +157,11 @@ async def upsert_company(client: httpx.AsyncClient, company_name: str, email: st
         if record_id:
             return record_id
 
-        domain = website.split("//")[-1].split("/")[0].lower()
+        # Deliberately omit "domains" here: it's Attio's one truly unique
+        # attribute on Companies, enforced at the backend regardless of which
+        # endpoint is called. Including it on create silently merges any
+        # record sharing that domain (e.g. a different store location on the
+        # same host) into the existing one instead of creating a new record.
         resp = await client.post(
             f"{ATTIO_BASE_URL}/objects/companies/records",
             headers=ATTIO_HEADERS,
@@ -166,7 +170,6 @@ async def upsert_company(client: httpx.AsyncClient, company_name: str, email: st
                     "values": {
                         "name": company_name,
                         ATTIO_WEBSITE_FIELD: normalized_website,
-                        "domains": [domain],
                     }
                 }
             },
