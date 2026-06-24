@@ -180,7 +180,23 @@ async def update_list_entry_stage(client: httpx.AsyncClient, entry_id: str, stag
         logger.error("Attio update_list_entry_stage failed (%s): %s", resp.status_code, resp.text)
 
 
+def normalize_payload(payload: dict) -> dict:
+    # Instantly's real webhook body uses camelCase for these three fields
+    # (firstName/lastName/companyName), not the snake_case shown in their
+    # docs example. Normalize to snake_case so the rest of the pipeline only
+    # has to deal with one convention.
+    normalized = dict(payload)
+    if not normalized.get("first_name") and payload.get("firstName"):
+        normalized["first_name"] = payload["firstName"]
+    if not normalized.get("last_name") and payload.get("lastName"):
+        normalized["last_name"] = payload["lastName"]
+    if not normalized.get("company_name") and payload.get("companyName"):
+        normalized["company_name"] = payload["companyName"]
+    return normalized
+
+
 async def handle_event(payload: dict) -> None:
+    payload = normalize_payload(payload)
     event_type = payload.get("event_type")
     email = payload.get("lead_email")
     logger.info("Received event=%s email=%s at %s", event_type, email, datetime.now(timezone.utc).isoformat())
@@ -196,6 +212,8 @@ async def handle_event(payload: dict) -> None:
 
     async with httpx.AsyncClient(timeout=15) as client:
         if not payload.get("company_name"):
+            # Some event types (e.g. reply_received) may not carry lead
+            # details inline; fall back to looking the lead up by email.
             lead_details = await fetch_lead_details(client, email)
             payload = {**payload, **{k: v for k, v in lead_details.items() if v}}
 
