@@ -26,6 +26,15 @@ ATTIO_STAGE_FIELD = os.environ.get("ATTIO_STAGE_FIELD", "lead_captured")
 # No campaign field exists on the list yet; set ATTIO_CAMPAIGN_FIELD once one
 # is added (e.g. a text attribute with slug "instantly_campaign").
 ATTIO_CAMPAIGN_FIELD = os.environ.get("ATTIO_CAMPAIGN_FIELD")
+# Custom text field on Companies storing the normalized lead "website" URL
+# (query string stripped, path kept). Used as the matching key for company
+# identity instead of email/domain — many SMB leads share a third-party host
+# (Facebook, eBay, Alibaba pages) where the registrable domain is the same
+# across unrelated businesses, but each business's specific page is unique.
+# Attio doesn't support is_unique on text attributes, so matching is done in
+# application code (query-then-create) rather than via Attio's built-in
+# matching_attribute upsert.
+ATTIO_WEBSITE_FIELD = os.environ.get("ATTIO_WEBSITE_FIELD", "instantly_website_url")
 
 ATTIO_BASE_URL = "https://api.attio.com/v2"
 ATTIO_HEADERS = {
@@ -116,14 +125,61 @@ async def upsert_person(client: httpx.AsyncClient, payload: dict) -> dict | None
     return data.get("data", {}).get("id", {}).get("record_id")
 
 
-async def upsert_company(client: httpx.AsyncClient, company_name: str, email: str) -> str | None:
-    domain = email.split("@")[-1].lower()
-    resp = await client.put(
-        f"{ATTIO_BASE_URL}/objects/companies/records",
+def normalize_website(website: str) -> str:
+    return website.split("?")[0]
+
+
+async def find_company_by_website(client: httpx.AsyncClient, website: str) -> str | None:
+    resp = await client.post(
+        f"{ATTIO_BASE_URL}/objects/companies/records/query",
         headers=ATTIO_HEADERS,
-        params={"matching_attribute": "domains"},
-        json={"data": {"values": {"domains": [domain], "name": company_name}}},
+        json={"filter": {ATTIO_WEBSITE_FIELD: website}, "limit": 1},
     )
+    if resp.status_code >= 300:
+        logger.error("Attio find_company_by_website failed (%s): %s", resp.status_code, resp.text)
+        return None
+
+    items = resp.json().get("data", [])
+    if not items:
+        return None
+    return items[0]["id"]["record_id"]
+
+
+async def upsert_company(client: httpx.AsyncClient, company_name: str, email: str, website: str | None) -> str | None:
+    if website:
+        # Many SMB leads are hosted on a shared third-party domain (Facebook,
+        # eBay, Alibaba pages), so matching on domain alone would incorrectly
+        # merge unrelated businesses. Match on the full normalized page URL
+        # instead, looked up in application code since Attio doesn't support
+        # is_unique on text attributes.
+        normalized_website = normalize_website(website)
+        record_id = await find_company_by_website(client, normalized_website)
+        if record_id:
+            return record_id
+
+        domain = website.split("//")[-1].split("/")[0].lower()
+        resp = await client.post(
+            f"{ATTIO_BASE_URL}/objects/companies/records",
+            headers=ATTIO_HEADERS,
+            json={
+                "data": {
+                    "values": {
+                        "name": company_name,
+                        ATTIO_WEBSITE_FIELD: normalized_website,
+                        "domains": [domain],
+                    }
+                }
+            },
+        )
+    else:
+        domain = email.split("@")[-1].lower()
+        resp = await client.put(
+            f"{ATTIO_BASE_URL}/objects/companies/records",
+            headers=ATTIO_HEADERS,
+            params={"matching_attribute": "domains"},
+            json={"data": {"values": {"domains": [domain], "name": company_name}}},
+        )
+
     if resp.status_code >= 300:
         logger.error("Attio upsert_company failed (%s): %s", resp.status_code, resp.text)
         return None
@@ -227,7 +283,7 @@ async def handle_event(payload: dict) -> None:
             logger.warning("Skipping list entry for %s: missing company_name (list is keyed on companies)", email)
             return
 
-        company_record_id = await upsert_company(client, company_name, email)
+        company_record_id = await upsert_company(client, company_name, email, payload.get("website"))
         if not company_record_id:
             return
 
