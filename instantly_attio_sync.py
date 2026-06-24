@@ -13,6 +13,7 @@ load_dotenv()
 
 ATTIO_API_KEY = os.environ["ATTIO_API_KEY"]
 ATTIO_LIST_ID = os.environ["ATTIO_LIST_ID"]
+INSTANTLY_API_KEY = os.environ["INSTANTLY_API_KEY"]
 # Attio custom-field slugs include a random numeric suffix per workspace;
 # override this if the "company name" field is renamed/recreated.
 ATTIO_COMPANY_NAME_FIELD = os.environ.get("ATTIO_COMPANY_NAME_FIELD", "company_name_1774195769")
@@ -32,6 +33,12 @@ ATTIO_HEADERS = {
     "Content-Type": "application/json",
 }
 
+INSTANTLY_BASE_URL = "https://api.instantly.ai/api/v2"
+INSTANTLY_HEADERS = {
+    "Authorization": f"Bearer {INSTANTLY_API_KEY}",
+    "Content-Type": "application/json",
+}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("instantly_attio_sync")
 
@@ -47,6 +54,31 @@ EVENT_STAGE_MAP = {
 
 def normalize_campaign_name(campaign_name: str) -> str:
     return "".join(campaign_name.split()).lower()
+
+
+async def fetch_lead_details(client: httpx.AsyncClient, email: str) -> dict:
+    # Instantly's webhook payload only includes lead_email/campaign_name; the
+    # lead's first_name/last_name/company_name live on the Lead record itself.
+    resp = await client.post(
+        f"{INSTANTLY_BASE_URL}/leads/list",
+        headers=INSTANTLY_HEADERS,
+        json={"contacts": [email], "limit": 1},
+    )
+    if resp.status_code >= 300:
+        logger.error("Instantly fetch_lead_details failed (%s): %s", resp.status_code, resp.text)
+        return {}
+
+    items = resp.json().get("items", [])
+    if not items:
+        logger.warning("No Instantly lead found for %s", email)
+        return {}
+
+    lead = items[0]
+    return {
+        "first_name": lead.get("first_name"),
+        "last_name": lead.get("last_name"),
+        "company_name": lead.get("company_name"),
+    }
 
 
 async def upsert_person(client: httpx.AsyncClient, payload: dict) -> dict | None:
@@ -162,9 +194,13 @@ async def handle_event(payload: dict) -> None:
         logger.warning("Skipping event %s: missing email", event_type)
         return
 
-    company_name = payload.get("company_name")
-
     async with httpx.AsyncClient(timeout=15) as client:
+        if not payload.get("company_name"):
+            lead_details = await fetch_lead_details(client, email)
+            payload = {**payload, **{k: v for k, v in lead_details.items() if v}}
+
+        company_name = payload.get("company_name")
+
         person_record_id = await upsert_person(client, payload)
         if not person_record_id:
             return
