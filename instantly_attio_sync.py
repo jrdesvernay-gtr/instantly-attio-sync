@@ -312,43 +312,51 @@ async def handle_event(payload: dict) -> None:
             await create_list_entry(client, company_record_id, "Lead Captured", payload.get("campaign_name"))
 
 
-async def handle_posthog_event(email: str, posthog_event: str) -> None:
+async def handle_posthog_event(email: str, posthog_event: str, business_name: str | None = None) -> None:
     """Update a company's lifecycle stage based on a PostHog product event."""
     stage = POSTHOG_STAGE_MAP.get(posthog_event)
     if not stage:
         logger.warning("Unhandled PostHog event: %s", posthog_event)
         return
 
-    logger.info("PostHog event=%s email=%s → stage=%s", posthog_event, email, stage)
+    logger.info("PostHog event=%s email=%s business_name=%s → stage=%s", posthog_event, email, business_name, stage)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        # Resolve the person to get their company name, then find the company record.
-        person_resp = await client.post(
-            f"{ATTIO_BASE_URL}/objects/people/records/query",
-            headers=ATTIO_HEADERS,
-            json={"filter": {"email_addresses": {"$eq": email}}, "limit": 1},
-        )
-        if person_resp.status_code >= 300:
-            logger.error("Attio person lookup failed (%s): %s", person_resp.status_code, person_resp.text)
-            return
+        company_record_id = None
 
-        people = person_resp.json().get("data", [])
-        if not people:
-            logger.warning("No Attio person found for PostHog email %s", email)
-            return
+        # Use business_name from the event payload directly if available — faster
+        # and more reliable than resolving person → company_name → company record.
+        if business_name:
+            company_record_id = await find_company_by_name(client, business_name)
 
-        # Extract company name from the custom field on the person record.
-        person_values = people[0].get("values", {})
-        company_name_values = person_values.get(ATTIO_COMPANY_NAME_FIELD, [])
-        company_name = company_name_values[0].get("value") if company_name_values else None
-
-        if not company_name:
-            logger.warning("Person %s has no company_name; cannot update list entry", email)
-            return
-
-        company_record_id = await find_company_by_name(client, company_name)
+        # Fall back to resolving via the person record's company_name field.
         if not company_record_id:
-            logger.warning("No Attio company found for name '%s' (email %s)", company_name, email)
+            person_resp = await client.post(
+                f"{ATTIO_BASE_URL}/objects/people/records/query",
+                headers=ATTIO_HEADERS,
+                json={"filter": {"email_addresses": {"$eq": email}}, "limit": 1},
+            )
+            if person_resp.status_code >= 300:
+                logger.error("Attio person lookup failed (%s): %s", person_resp.status_code, person_resp.text)
+                return
+
+            people = person_resp.json().get("data", [])
+            if not people:
+                logger.warning("No Attio person found for PostHog email %s", email)
+                return
+
+            person_values = people[0].get("values", {})
+            company_name_values = person_values.get(ATTIO_COMPANY_NAME_FIELD, [])
+            company_name = company_name_values[0].get("value") if company_name_values else None
+
+            if not company_name:
+                logger.warning("Person %s has no company_name; cannot update list entry", email)
+                return
+
+            company_record_id = await find_company_by_name(client, company_name)
+
+        if not company_record_id:
+            logger.warning("No Attio company found for PostHog event (email=%s business_name=%s)", email, business_name)
             return
 
         existing = await find_list_entry(client, company_record_id)
@@ -387,15 +395,24 @@ async def posthog_webhook(request: Request):
         return JSONResponse(status_code=200, content={"status": "ignored"})
 
     try:
-        event = payload.get("event")
-        # PostHog sends the user identifier as distinct_id; fall back to properties.email.
-        email = payload.get("distinct_id") or payload.get("properties", {}).get("email")
+        # PostHog wraps the event in a nested structure:
+        # { "event": { "event": "trial_started", "distinct_id": "...", "properties": {...} }, "person": {...} }
+        event_obj = payload.get("event", {})
+        event = event_obj.get("event")
+        props = event_obj.get("properties", {})
+
+        email = event_obj.get("distinct_id") or props.get("email")
+        # business_name is sent directly in event properties — use it to find
+        # the company record without an extra Attio person lookup.
+        business_name = props.get("business_name") or payload.get("person", {}).get("properties", {}).get("business_name")
+
         if not email or "@" not in email:
-            logger.warning("PostHog webhook missing usable email (distinct_id=%s)", payload.get("distinct_id"))
+            logger.warning("PostHog webhook missing usable email (distinct_id=%s)", event_obj.get("distinct_id"))
             return JSONResponse(status_code=200, content={"status": "ignored"})
-        await handle_posthog_event(email, event)
+
+        await handle_posthog_event(email, event, business_name)
     except Exception:
-        logger.exception("Unhandled error processing PostHog event %s", payload.get("event"))
+        logger.exception("Unhandled error processing PostHog event %s", payload.get("event", {}).get("event"))
 
     return JSONResponse(status_code=200, content={"status": "received"})
 
